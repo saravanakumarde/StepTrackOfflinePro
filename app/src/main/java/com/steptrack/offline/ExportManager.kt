@@ -27,8 +27,8 @@ object ExportManager {
         val pr = Prefs(c)
         val moves = kotlinx.coroutines.runBlocking { AppDb.get(c).dao().allMoves() }
         val gps = kotlinx.coroutines.runBlocking { AppDb.get(c).dao().allGps() }
-        val types = classifyMoves(gps, all.values.flatten().map { it.timestamp })
         val places = kotlinx.coroutines.runBlocking { AppDb.get(c).dao().allPlaces() }
+        val types = classifyMoves(gps, all.values.flatten().map { it.timestamp }, stationPlaces(places, pr.stationIds))
         when (kind) { "csv" -> csv(all, pr, out); "trackcsv" -> trackCsv(all, gps, types, places, out); "kml" -> kml(gps, types, places, out); "json" -> json(all, pr, out, moves, gps, types, places); else -> pdf(all, pr, out) }
     }
     private fun trackCsv(all: Map<String, List<StepEvent>>, gps: List<GpsPoint>, types: List<Int>, places: List<Place>, out: OutputStream) {
@@ -47,7 +47,7 @@ object ExportManager {
     private fun kml(gps: List<GpsPoint>, types: List<Int>, places: List<Place>, out: OutputStream) {
         val tf = SimpleDateFormat("HH:mm", Locale.US)
         val iso = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }
-        val cols = listOf("ff9e9e9e", "ff50af4c", "ff0098ff", "ffd4bc00", "ff3bebff", "ff3643f4")
+        val cols = listOf("ff9e9e9e", "ff50af4c", "ff0098ff", "ffd4bc00", "ff3bebff", "ff3643f4", "ffb0279c")
         val sb = StringBuilder("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<kml xmlns=\"http://www.opengis.net/kml/2.2\"><Document><name>StepTrack</name>\n")
         cols.forEachIndexed { i, c -> sb.append("<Style id=\"s$i\"><LineStyle><color>$c</color><width>4</width></LineStyle></Style>\n") }
         fun co(g: GpsPoint) = "${g.lon},${g.lat}"
@@ -70,7 +70,7 @@ object ExportManager {
             var t0 = 0
             for (k in 1..idxs.size) if (k == idxs.size || gps[idxs[k]].timestamp - gps[idxs[k - 1]].timestamp > 180000) {
                 for ((label, g) in listOf("Start" to gps[idxs[t0]], "End" to gps[idxs[k - 1]])) {
-                    val nm = placeFor(g.lat, g.lon, places)?.name
+                    val nm = placeNear(g.lat, g.lon, places)?.name
                     sb.append("<Placemark><name>${esc(label + " " + tf.format(Date(g.timestamp)) + (if (nm != null) ": $nm" else ""))}</name><Point><coordinates>${co(g)}</coordinates></Point></Placemark>\n")
                 }
                 t0 = k

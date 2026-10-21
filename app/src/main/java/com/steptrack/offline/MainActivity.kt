@@ -38,6 +38,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -63,8 +64,8 @@ class MainActivity : ComponentActivity() {
             AppLog.i("Activity", "starting StepCounterService"); ContextCompat.startForegroundService(this, Intent(this, StepCounterService::class.java))
         } else AppLog.e("Activity", "ACTIVITY_RECOGNITION not granted: step service NOT started")
     }
-    override fun onResume() { super.onResume(); AppLog.i("Activity", "onResume") }
-    override fun onPause() { super.onPause(); AppLog.i("Activity", "onPause"); AppLog.flush() }
+    override fun onResume() { super.onResume(); LiveState.uiVisible.value = true; AppLog.i("Activity", "onResume") }
+    override fun onPause() { super.onPause(); LiveState.uiVisible.value = false; AppLog.i("Activity", "onPause"); AppLog.flush() }
     override fun onDestroy() { AppLog.i("Activity", "onDestroy isFinishing=$isFinishing"); super.onDestroy() }
 }
 
@@ -213,8 +214,10 @@ suspend fun resolvePlacePosition(c: Context): Triple<Double, Double, String>? {
     val pts by remember(dateM) { AppDb.get(c).dao().gpsFlow(dateM) }.collectAsState(emptyList())
     val speed by LiveState.speed.collectAsState(); val status by LiveState.gpsStatus.collectAsState(); val h by LiveState.heading.collectAsState()
     val ev = rememberEvents(dateM)
+    val places by remember { AppDb.get(c).dao().placesFlow() }.collectAsState(emptyList())
+    var stTick by remember { mutableIntStateOf(0) }
     val cur = if (isToday) pts.filter { it.timestamp >= p.moveSession } else pts
-    val types = remember(cur, ev) { classifyMoves(cur, ev.map { it.timestamp }) }
+    val types = remember(cur, ev, places, stTick) { classifyMoves(cur, ev.map { it.timestamp }, stationPlaces(places, p.stationIds)) }
     val byType = remember(cur, types) { distByType(cur, types) }
     val steps = if (isToday) ev.count { it.timestamp >= p.moveSession } else ev.size
     val dist = if (cur.size > 1) cur.last().distance - cur.first().distance else 0f
@@ -231,10 +234,9 @@ suspend fun resolvePlacePosition(c: Context): Triple<Double, Double, String>? {
     val bgOk = Build.VERSION.SDK_INT < 29 || ContextCompat.checkSelfPermission(c, Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED
     val ignBat = (c.getSystemService(Context.POWER_SERVICE) as PowerManager).isIgnoringBatteryOptimizations(c.packageName)
     fun send(a: String) { c.startService(Intent(c, StepCounterService::class.java).setAction(a)) }
-    val places by remember { AppDb.get(c).dao().placesFlow() }.collectAsState(emptyList())
     val fix by LiveState.fix.collectAsState(); val scope = rememberCoroutineScope()
-    var pName by remember { mutableStateOf("") }; var pRad by remember { mutableStateOf("100") }; var pMsg by remember { mutableStateOf("") }
-    fun nm(g: GpsPoint) = placeFor(g.lat, g.lon, places)?.name ?: "Unnamed place"
+    var pName by remember { mutableStateOf("") }; var pRad by remember { mutableStateOf("75") }; var pMsg by remember { mutableStateOf("") }
+    fun nm(g: GpsPoint) = placeNear(g.lat, g.lon, places)?.name ?: "Unnamed place"
     val permL = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         val okLoc = ContextCompat.checkSelfPermission(c, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
         AppLog.i("Permissions", "location permission result: fineGranted=$okLoc")
@@ -292,10 +294,35 @@ suspend fun resolvePlacePosition(c: Context): Triple<Double, Double, String>? {
             val d = t.last().distance - t.first().distance; val sec = ((t.last().timestamp - t.first().timestamp) / 1000f).coerceAtLeast(1f)
             Text("${nm(t.first())} → ${nm(t.last())}\n${tf.format(Date(t.first().timestamp))} - ${tf.format(Date(t.last().timestamp))}   ${"%.2f".format(d / 1000f)} km   avg ${"%.0f".format(d / sec * 3.6f)} km/h   max ${"%.0f".format(t.maxOf { it.speed } * 3.6f)} km/h", fontSize = 13.sp)
         }
-        val visits = trips.zipWithNext().mapNotNull { (a, b) -> placeFor(a.last().lat, a.last().lon, places)?.let { Triple(it.name, a.last().timestamp, b.first().timestamp) } }
+        val visits = trips.zipWithNext().mapNotNull { (a, b) -> placeNear(a.last().lat, a.last().lon, places)?.let { Triple(it.name, a.last().timestamp, b.first().timestamp) } }
         if (visits.isNotEmpty()) {
             Text("Stops at your places", fontSize = 16.sp)
             visits.asReversed().take(10).forEach { Text("${it.first}   ${tf.format(Date(it.second))} - ${tf.format(Date(it.third))}   (${(it.third - it.second) / 60000} min)", fontSize = 13.sp) }
+        }
+        var sugg by remember { mutableStateOf<List<Triple<Double, Double, Int>>>(emptyList()) }
+        val sugNames = remember { mutableStateMapOf<Int, String>() }
+        LaunchedEffect(places.size) {
+            sugg = withContext(Dispatchers.IO) {
+                val all = AppDb.get(c).dao().allGps(); val ends = ArrayList<GpsPoint>(); var s0 = 0
+                for (i in 1..all.size) if (i == all.size || all[i].timestamp - all[i - 1].timestamp > 180_000L) { val a = all[s0]; val b = all[i - 1]; if (b.distance - a.distance >= 100f && a.date == b.date) { ends.add(a); ends.add(b) }; s0 = i }
+                val cl = ArrayList<Triple<Double, Double, Int>>(); val r = FloatArray(1)
+                for (g in ends) {
+                    if (places.any { pl -> android.location.Location.distanceBetween(g.lat, g.lon, pl.lat, pl.lon, r); r[0] < 150f }) continue
+                    val k = cl.indexOfFirst { q -> android.location.Location.distanceBetween(g.lat, g.lon, q.first, q.second, r); r[0] < 100f }
+                    if (k >= 0) cl[k] = Triple(cl[k].first, cl[k].second, cl[k].third + 1) else cl.add(Triple(g.lat, g.lon, 1))
+                }
+                cl.filter { it.third >= 3 }.sortedByDescending { it.third }.take(3)
+            }
+        }
+        if (sugg.isNotEmpty()) {
+            Text("Frequent stops without a name", fontSize = 16.sp)
+            sugg.forEachIndexed { i, q ->
+                Text("Seen ${q.third} times near %.4f, %.4f".format(q.first, q.second), fontSize = 13.sp)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(sugNames[i] ?: "", { sugNames[i] = it }, label = { Text("Name") }, singleLine = true, modifier = Modifier.weight(1f))
+                    Button({ val nm = (sugNames[i] ?: "").trim(); if (nm.isNotEmpty()) { AppLog.i("UI", "suggested place named '$nm'"); scope.launch(Dispatchers.IO) { AppDb.get(c).dao().insertPlace(Place(name = nm, lat = q.first, lon = q.second, radius = 75f)); AutoBackup.savePlaces(c) } } }) { Text("Save") }
+                }
+            }
         }
         Text("My places", fontSize = 16.sp)
         val here = fix?.let { f -> if (System.currentTimeMillis() - f.third < 120000) placeFor(f.first, f.second, places)?.name else null }
@@ -303,7 +330,7 @@ suspend fun resolvePlacePosition(c: Context): Triple<Double, Double, String>? {
         OutlinedTextField(pName, { pName = it }, label = { Text("Place name (e.g. Home)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
         OutlinedTextField(pRad, { pRad = it }, label = { Text("Radius in meters") }, singleLine = true, modifier = Modifier.fillMaxWidth())
         Button({
-            val nm = pName.trim(); val r = pRad.toFloatOrNull()?.coerceIn(20f, 1000f) ?: 100f
+            val nm = pName.trim(); val r = pRad.toFloatOrNull()?.coerceIn(20f, 1000f) ?: 75f
             AppLog.i("Place", "save pressed: name='$nm' radiusField='$pRad' radius=${r.toInt()} m, tracking=${p.moveOn}, gps='${LiveState.gpsStatus.value}', liveFixAge=${fix?.let { (System.currentTimeMillis() - it.third) / 1000 } ?: -1}s")
             if (nm.isEmpty()) { pMsg = "Enter a name first"; AppLog.w("Place", "save rejected: no name") }
             else { pMsg = "Looking for a position…"
@@ -323,6 +350,8 @@ suspend fun resolvePlacePosition(c: Context): Triple<Double, Double, String>? {
         places.forEach { pl ->
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("${pl.name}  (${pl.radius.toInt()} m)", Modifier.weight(1f))
+                var isSt by remember(pl.id, stTick) { mutableStateOf(isStation(pl, p.stationIds)) }
+                Text("Station", fontSize = 12.sp); Checkbox(isSt, { on -> isSt = on; val ids = p.stationIds.toMutableSet(); if (on) ids.add(pl.id.toString()) else ids.remove(pl.id.toString()); p.stationIds = ids; stTick++; AppLog.i("UI", "place ${pl.name} station=$on") })
                 Button({ AppLog.i("UI", "place deleted: ${pl.name}"); scope.launch(Dispatchers.IO) { AppDb.get(c).dao().deletePlace(pl.id); AutoBackup.savePlaces(c) } }) { Text("Delete") }
             }
         }
@@ -337,7 +366,7 @@ suspend fun resolvePlacePosition(c: Context): Triple<Double, Double, String>? {
     val gps by remember(date) { AppDb.get(c).dao().gpsFlow(date) }.collectAsState(emptyList())
     val alt by LiveState.alt.collectAsState(); val anch by LiveState.altAnchored.collectAsState(); val baro by LiveState.baro.collectAsState()
     val series = remember(ev, gps) { altSeries(ev, gps) }
-    val st = remember(series, baro) { elevStats(series.map { it.second }, if (baro) 1.5f else 6f) }
+    val st = remember(series, baro) { elevStats(series.map { it.second }, if (baro) 1.5f else 10f) }
     val chart = remember(series) { downsample(series, 400) }
     val pts3 = remember(ev, gps) {
         val g = gps.filter { it.alt > -9000f }.map { P3(it.timestamp, it.x, it.y, it.alt) }
@@ -369,7 +398,7 @@ suspend fun resolvePlacePosition(c: Context): Triple<Double, Double, String>? {
             Button({ if (alt > -9000f) { gnd = alt; p.groundAlt = alt; AppLog.i("UI", "ground level set to $alt m") } }, enabled = alt > -9000f) { Text("Set ground level here") }
             if (gnd > -9000f) Button({ gnd = -9999f; p.groundAlt = -9999f }) { Text("Clear") }
         }
-        if (!baro) Text("No barometer in this phone: heights come from GPS and are noisy, so climb totals are approximate (changes under 6 m are ignored).", fontSize = 12.sp)
+        if (!baro) Text("No barometer in this phone: heights come from GPS and are noisy, so climb totals are approximate (changes under 10 m are ignored).", fontSize = 12.sp)
         if (st == null) Text("No elevation data for this day yet.")
         else {
             Row(Modifier.fillMaxWidth()) {
@@ -478,6 +507,10 @@ suspend fun resolvePlacePosition(c: Context): Triple<Double, Double, String>? {
         val logKb = logTick.let { AppLog.sizeBytes() / 1024 }
         Text("The app keeps a private log (service start/stop, sensors, GPS, steps, errors, backups, your button presses) plus a one-minute heartbeat with battery and sensor state. Nothing leaves the phone unless you export it. The ZIP holds the report, the full log and all raw data, including your GPS positions.", fontSize = 12.sp)
         Text("Log size: $logKb KB, ${logTick.let { AppLog.lineCount() }} lines. A copy is kept in Documents/StepTrack/logs when storage access is allowed.", fontSize = 12.sp)
+        Text("Battery impact (last 24 h, from the log)", fontSize = 16.sp)
+        var batLines by remember { mutableStateOf(listOf("calculating…")) }
+        LaunchedEffect(logTick) { batLines = withContext(Dispatchers.IO) { Diagnostics.batteryStats(System.currentTimeMillis() - 86_400_000L) } }
+        batLines.forEach { Text(it, fontSize = 11.sp) }
         Button({ val st = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date()); AppLog.i("UI", "export diagnostic package"); diagL.launch("steptrack-diagnostics-$st.zip") }) { Text("Export diagnostic package (ZIP, everything)") }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button({ val st = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date()); repL.launch("steptrack-report-$st.txt") }) { Text("Report only") }

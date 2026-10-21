@@ -119,6 +119,9 @@ class Prefs(c: Context) {
     var moveSession: Long get() = sp.getLong("moveSession", 0L); set(v) = sp.edit().putLong("moveSession", v).apply()
     val sp = c.getSharedPreferences("st", 0)
     var goal: Int get() = sp.getInt("goal", 10000); set(v) = sp.edit().putInt("goal", v).apply()
+    var stationIds: Set<String> get() = sp.getStringSet("stations", emptySet())?.toSet() ?: emptySet(); set(v) = sp.edit().putStringSet("stations", v).apply()
+    var declination: Float get() = sp.getFloat("decl", 0f); set(v) = sp.edit().putFloat("decl", v).apply()
+    var compassOff: Float get() = sp.getFloat("compassOff", 0f); set(v) = sp.edit().putFloat("compassOff", v).apply()
     var stride: Float get() = sp.getFloat("stride", 0.8f); set(v) = sp.edit().putFloat("stride", v).apply()
     var weight: Float get() = sp.getFloat("weight", 70f); set(v) = sp.edit().putFloat("weight", v).apply()
     var sessionStart: Long get() = sp.getLong("session", 0L); set(v) = sp.edit().putLong("session", v).apply()
@@ -128,6 +131,7 @@ class Prefs(c: Context) {
 }
 
 object LiveState {
+    val uiVisible = MutableStateFlow(false) // app screen is open: compass stays on, GPS wakes
     val heading = MutableStateFlow(0f); val accuracy = MutableStateFlow(0); val steps = MutableStateFlow(0); val speed = MutableStateFlow(0f); val moveOn = MutableStateFlow(false); val gpsStatus = MutableStateFlow("Off"); val backupStatus = MutableStateFlow(""); val alt = MutableStateFlow(NO_ALT); val altAnchored = MutableStateFlow(false); val baro = MutableStateFlow(false); val fix = MutableStateFlow<Triple<Double, Double, Long>?>(null)
 }
 

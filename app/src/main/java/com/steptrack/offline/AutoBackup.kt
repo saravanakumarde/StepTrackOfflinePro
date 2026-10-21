@@ -25,9 +25,9 @@ object AutoBackup {
             val dao = AppDb.get(c).dao(); val pr = Prefs(c)
             val ev = dao.events(d); val gps = dao.gps(d); val places = dao.allPlaces()
             if (ev.isEmpty() && gps.isEmpty()) return true
-            val types = classifyMoves(gps, ev.map { it.timestamp }); val dist = distByType(gps, types); val s = buildSummary(d, ev, pr.stride, pr.weight)
+            val types = classifyMoves(gps, ev.map { it.timestamp }, stationPlaces(places, pr.stationIds)); val dist = distByType(gps, types); val s = buildSummary(d, ev, pr.stride, pr.weight)
             val byType = JSONObject(); for (i in 1 until MOVE_NAMES.size) byType.put(MOVE_NAMES[i], dist[i].toDouble())
-            val es = elevStats(altSeries(ev, gps).map { it.second }, if (LiveState.baro.value) 1.5f else 6f); val elevJ = JSONObject()
+            val es = elevStats(altSeries(ev, gps).map { it.second }, if (LiveState.baro.value) 1.5f else 10f); val elevJ = JSONObject()
             es?.let { elevJ.put("min_m", it.min.toDouble()).put("max_m", it.max.toDouble()).put("ascent_m", it.ascent.toDouble()).put("descent_m", it.descent.toDouble()) }
             val settings = JSONObject().put("goal", pr.goal).put("stride_m", pr.stride.toDouble()).put("weight_kg", pr.weight.toDouble())
             val summary = JSONObject().put("total_steps", s.totalSteps).put("walk_distance_m", s.distanceM.toDouble()).put("calories", s.calories.toDouble())

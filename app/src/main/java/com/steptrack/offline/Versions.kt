@@ -4,6 +4,16 @@ data class VersionInfo(val id: String, val title: String, val notes: List<String
 
 /** Newest first. Shown in More > Settings > Version history. */
 val VERSION_HISTORY = listOf(
+    VersionInfo("V17", "Step accuracy, battery and places", listOf(
+        "Steps: counter and per-step detector are reconciled on running totals with a 15 s grace period, so no step is counted twice",
+        "Compass runs at 5 Hz and only while the app is open or you are walking (was 50 readings per second all day)",
+        "GPS switches fully off after 5 min still; steps, significant motion or opening the app wake it",
+        "Stationary lock no longer flaps on trains: 100 m movement in 30 s keeps it off; log spam removed, log keeps about 3x more days",
+        "Places: default radius 75 m, trip start/end labelled with the nearest place within 150 m, frequent unnamed stops suggested for naming",
+        "Compass: offline magnetic declination applied and a small offset learned from GPS course",
+        "Altitude: 10 m hysteresis with median filter, poor vertical accuracy ignored; diagnostic climb totals per day",
+        "New movement type Train (vehicle run between places marked Station or named Bf / Bahnhof / Hbf / Station)",
+        "More: battery impact card (drain per hour by GPS mode); diagnostic report adds battery, step reconciliation and place-match checks")),
     VersionInfo("V16", "Date picker and distances on the circles", listOf(
         "Walk, Move and Height share one date bar: previous / next day buttons and a calendar",
         "Past days: path, replay, zoom, stats and trips all show the chosen day",

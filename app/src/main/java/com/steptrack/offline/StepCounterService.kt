@@ -19,6 +19,7 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.cos
 import kotlin.math.abs
 import kotlin.math.max
@@ -47,7 +48,15 @@ class StepCounterService : Service(), SensorEventListener {
     private var hbPrev: Map<String, Long> = emptyMap(); private var hbIdle = 0
     // V15: step pipeline (per-step times + headings), gait fallback, GPS power modes, stationary lock
     private val HN = 256; private val hT = LongArray(HN); private val hH = FloatArray(HN); private var hN = 0; private val hLock = Any(); private var lastHPush = 0L
-    private var lastStepTs = 0L; private var lastCounterAt = 0L; private var detSince = 0; private var accelSince = 0
+    private var lastStepTs = 0L
+    // V17: running totals for step reconciliation (counter vs per-step events), GPS sleep, movement hysteresis
+    private val rLock = Any(); private var counterCum = 0L; private var recCum = 0L; private var deficitSince = 0L
+    @Volatile private var gpsSleeping = false; private var sleepAt = 0L
+    private var lastMoveAt = 0L; private var refPos: Location? = null; private var refAt = 0L
+    private var lastLockLog = 0L; private var lastRejLog = 0L; private var lastDeclAt = 0L; private var learnN = 0
+    private val fusionN = AtomicLong(0)
+    private val sigS: Sensor? by lazy { sm.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION) }
+    private val sigL = object : TriggerEventListener() { override fun onTrigger(e: TriggerEvent?) { gpsWake("significant motion") } }
     @Volatile private var lastHwStepAt = 0L; @Volatile private var lastAnyStepAt = 0L
     private var accelOn = false; private var gaitRun = 0; private var lastGaitPeak = 0L; private var walkGpsSince = 0L
     @Volatile private var gpsCourse = 0f; @Volatile private var gpsCourseAt = 0L
@@ -73,10 +82,11 @@ class StepCounterService : Service(), SensorEventListener {
         (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
         ServiceCompat.startForeground(this, 1, notif(), ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH)
         fusion = SensorFusionHelper(this) { h, a ->
-            val tn = System.currentTimeMillis(); lastFusionAt = tn; AppLog.count("fusion_evt")
-            if (tn - lastHPush >= 200L) { lastHPush = tn; pushHeading(h, tn) }
+            val tn = System.currentTimeMillis(); lastFusionAt = tn; fusionN.incrementAndGet()
+            if (tn - lastHPush >= 150L) { lastHPush = tn; pushHeading(h, tn) }
             LiveState.heading.value = h; LiveState.accuracy.value = a
         }
+        fusion.declination = prefs.declination; fusion.offset = prefs.compassOff
         fusion.start()
         // Steps: hardware counter (total) + wake-up step detector (per-step times); accelerometer gait detector as fallback
         val counter = sm.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
@@ -102,27 +112,45 @@ class StepCounterService : Service(), SensorEventListener {
             }
         }
         scope.launch { while (isActive) { delay(15_000L); val d = today(); if (d != curDate) { AppLog.i("Service", "new day $d: step count reset"); loadDay(d); refresh() } } }
+        scope.launch { // every 3 s: step reconciliation grace timer, compass on/off, GPS wake when the app is opened
+            var k = 0
+            while (isActive) {
+                delay(3_000L); k++
+                try {
+                    val now = System.currentTimeMillis()
+                    if (k % 2 == 0) reconcile(now)
+                    updateCompass(now)
+                    if (gpsSleeping && (LiveState.uiVisible.value || (sigS == null && now - sleepAt > 600_000L))) gpsWake(if (LiveState.uiVisible.value) "app opened" else "periodic check")
+                } catch (e: Exception) { AppLog.e("Service", "watcher failed", e) }
+            }
+        }
         scope.launch { delay(30_000); while (isActive) { try { heartbeat() } catch (e: Exception) { AppLog.e("HB", "heartbeat failed", e) }; delay(60_000) } }
     }
 
     /** One line per minute while active (one per 10 min when idle): state + counter deltas, for analysing reliability over time. */
     private fun heartbeat() {
-        val snap = AppLog.snapshot()
-        val keys = listOf("steps_counter", "steps_detector", "steps_accel", "burst_events", "fix_total", "fix_saved", "fix_rej_acc", "fix_jitter", "fix_locked", "fusion_evt")
-        val dl = keys.associateWith { (snap[it] ?: 0L) - (hbPrev[it] ?: 0L) }
-        hbPrev = snap
-        val active = dl.filterKeys { it != "fusion_evt" }.values.any { it != 0L }
+        val snap = AppLog.snapshot(); AppLog.count("fusion_evt", fusionN.getAndSet(0L))
+        val keys = listOf("steps_counter", "steps_detector", "steps_recon", "steps_accel", "fix_total", "fix_saved", "fix_rej_acc", "fix_jitter", "fix_locked", "fusion_evt")
+        val snap2 = AppLog.snapshot()
+        val dl = keys.associateWith { (snap2[it] ?: 0L) - (hbPrev[it] ?: 0L) }.filterValues { it != 0L }
+        hbPrev = snap2
+        val active = dl.filterKeys { it != "fusion_evt" }.isNotEmpty()
         hbIdle = if (active) 0 else hbIdle + 1
         if (!active && hbIdle % 10 != 0) { AppLog.flush(); return }
         val now = System.currentTimeMillis(); val pm = getSystemService(POWER_SERVICE) as PowerManager
         val bi = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         val bat = if (bi != null) 100 * bi.getIntExtra("level", 0) / bi.getIntExtra("scale", 100).coerceAtLeast(1) else -1
         val chg = if (bi != null) bi.getIntExtra("plugged", 0) != 0 else false
-        val rt = Runtime.getRuntime()
-        AppLog.i("HB", "up=${(now - svcStartAt) / 60000}m steps=$count d[${dl.entries.joinToString(" ") { "${it.key}=${it.value}" }}] heading=${LiveState.heading.value.toInt()} compassAcc=${LiveState.accuracy.value} " +
-            "gps='${LiveState.gpsStatus.value}' speed=${"%.1f".format(LiveState.speed.value)} alt=${LiveState.alt.value} bat=$bat% chg=$chg psave=${pm.isPowerSaveMode} doze=${pm.isDeviceIdleMode} screen=${pm.isInteractive} " +
-            "wakelock=${wl?.isHeld == true} gpsMode=${if (gpsActive) "1s" else "10s"} locked=${lockAnchor != null} accel=$accelOn fusionAge=${if (lastFusionAt == 0L) -1 else (now - lastFusionAt) / 1000}s stepSensorAge=${if (lastStepEvtAt == 0L) -1 else (now - lastStepEvtAt) / 1000}s heapMB=${(rt.totalMemory() - rt.freeMemory()) / 1048576}")
+        AppLog.i("HB", "up=${(now - svcStartAt) / 60000}m steps=$count d[${dl.entries.joinToString(" ") { "${it.key.removePrefix("steps_").removePrefix("fix_")}=${it.value}" }}] hdg=${LiveState.heading.value.toInt()} " +
+            "gps='${LiveState.gpsStatus.value}' bat=$bat% chg=$chg psave=${pm.isPowerSaveMode} doze=${pm.isDeviceIdleMode} screen=${pm.isInteractive} " +
+            "wakelock=${wl?.isHeld == true} gpsMode=${if (gpsSleeping) "off" else if (gpsActive) "1s" else "10s"} locked=${lockAnchor != null} accel=$accelOn compass=${fusion.isRunning} off=${fusion.offset.toInt()}")
         AppLog.flush()
+    }
+
+    /** Compass only runs while the app is open or steps were seen in the last minute (it was streaming 50 events/s all day). */
+    private fun updateCompass(now: Long) {
+        val want = LiveState.uiVisible.value || now - lastAnyStepAt < 60_000L
+        if (want) fusion.start() else fusion.stop()
     }
 
     override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
@@ -147,7 +175,8 @@ class StepCounterService : Service(), SensorEventListener {
         AppLog.i("GPS", "setMove(${on})")
         if (!on) {
             try { lm.removeUpdates(locL) } catch (_: Exception) {}
-            wl?.release(); wl = null; gpsActive = true; lockAnchor = null
+            try { sm.cancelTriggerSensor(sigL, sigS) } catch (_: Exception) {}
+            wl?.release(); wl = null; gpsActive = true; gpsSleeping = false; lockAnchor = null
             prefs.moveOn = false; LiveState.moveOn.value = false; LiveState.speed.value = 0f; LiveState.gpsStatus.value = "Off"
             try { ServiceCompat.startForeground(this, 1, notif(), ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH) } catch (_: Exception) {}
             return
@@ -166,7 +195,7 @@ class StepCounterService : Service(), SensorEventListener {
         } catch (e: Exception) {
             AppLog.e("GPS", "could not start location updates", e); prefs.moveOn = false; LiveState.moveOn.value = false; LiveState.gpsStatus.value = "Location not available"; return
         }
-        gpsActive = true; gpsModeAt = System.currentTimeMillis(); lastHold = 0L; holdAwake() // wake lock is now timed and only held while moving
+        gpsActive = true; gpsSleeping = false; lastMoveAt = System.currentTimeMillis(); refPos = null; gpsModeAt = System.currentTimeMillis(); lastHold = 0L; holdAwake() // wake lock is now timed and only held while moving
         prefs.moveOn = true; LiveState.moveOn.value = true; firstFixLogged = false; lastFixOk = true; lastFixAt = 0L
         AppLog.i("GPS", "tracking ON, gpsProviderEnabled=${lm.isProviderEnabled(LocationManager.GPS_PROVIDER)} bgLocation=${ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED}")
         LiveState.gpsStatus.value = if (lm.isProviderEnabled(LocationManager.GPS_PROVIDER)) "Searching for GPS…" else "GPS is off - enable Location in system settings"
@@ -191,20 +220,27 @@ class StepCounterService : Service(), SensorEventListener {
         if (!firstFixLogged) { firstFixLogged = true; AppLog.i("GPS", "first fix: acc=${l.accuracy} m speed=${if (l.hasSpeed()) l.speed else -1f} bearing=${l.hasBearing()} altitude=${l.hasAltitude()} vAcc=${if (l.hasVerticalAccuracy()) l.verticalAccuracyMeters else -1f}") }
         if (l.accuracy > 30f) {
             AppLog.count("fix_rej_acc")
-            if (lastFixOk) { lastFixOk = false; AppLog.w("GPS", "fixes being rejected: accuracy ${l.accuracy} m is worse than 30 m") }
+            if (lastFixOk) { lastFixOk = false; if (tNow - lastRejLog > 600_000L) { lastRejLog = tNow; AppLog.w("GPS", "fixes being rejected: accuracy ${l.accuracy} m is worse than 30 m (logged at most every 10 min)") } }
             return
         }
-        if (!lastFixOk) { lastFixOk = true; AppLog.i("GPS", "fixes accepted again (accuracy ${l.accuracy} m)") }
+        lastFixOk = true
         LiveState.speed.value = if (l.hasSpeed()) l.speed else 0f
         LiveState.fix.value = Triple(l.latitude, l.longitude, System.currentTimeMillis())
         // GPS course is more reliable than the compass while moving: used as the step direction for a few seconds
-        if (l.hasBearing() && l.hasSpeed() && l.speed >= 1.5f && l.accuracy <= 20f && (!l.hasBearingAccuracy() || l.bearingAccuracyDegrees <= 30f)) { gpsCourse = l.bearing; gpsCourseAt = tNow }
+        if (l.hasBearing() && l.hasSpeed() && l.speed >= 1.5f && l.accuracy <= 20f && (!l.hasBearingAccuracy() || l.bearingAccuracyDegrees <= 30f)) {
+            gpsCourse = l.bearing; gpsCourseAt = tNow
+            if (tNow - lastAnyStepAt < 10_000L && l.speed >= 1.2f) { fusion.learn(l.bearing); if (++learnN % 50 == 0) prefs.compassOff = fusion.offset }
+        }
+        if (tNow - lastDeclAt > 600_000L) { // offline magnetic declination (magnetic -> true north)
+            lastDeclAt = tNow
+            try { val gf = android.hardware.GeomagneticField(l.latitude.toFloat(), l.longitude.toFloat(), (if (l.hasAltitude()) l.altitude else 0.0).toFloat(), tNow); fusion.declination = gf.declination; prefs.declination = gf.declination } catch (_: Exception) {}
+        }
         // walking-speed GPS but no hardware steps: switch the accelerometer gait detector on (only then, to save battery)
         val walkSpeed = l.hasSpeed() && l.speed in 0.6f..2.6f
         if (walkSpeed) { if (walkGpsSince == 0L) walkGpsSince = tNow } else walkGpsSince = 0L
         val wantAccel = walkGpsSince != 0L && tNow - walkGpsSince > 8000L && tNow - lastHwStepAt > 12000L
         if (wantAccel != accelOn && (wantAccel || sm.getDefaultSensor(Sensor.TYPE_STEP_COUNTER) != null || sm.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR) != null)) setAccel(wantAccel)
-        if (prefs.elevOn && l.hasAltitude() && (!l.hasVerticalAccuracy() || l.verticalAccuracyMeters <= 25f)) {
+        if (prefs.elevOn && l.hasAltitude() && (!l.hasVerticalAccuracy() || l.verticalAccuracyMeters <= 15f)) {
             val ga0: Float = if (Build.VERSION.SDK_INT >= 34 && l.hasMslAltitude()) { AppLog.count("alt_msl"); l.mslAltitudeMeters.toFloat() } else { AppLog.count("alt_ellipsoid"); l.altitude.toFloat() }; gpsAltAt = System.currentTimeMillis()
             if (baroS != null && ps >= 0f) {
                 if (!offInit) { altOff = ga0 - baro; offInit = true } else altOff += 0.02f * (ga0 - (baro + altOff))
@@ -220,23 +256,28 @@ class StepCounterService : Service(), SensorEventListener {
         scope.launch {
             if (!hasOrigin) { hasOrigin = true; lat0 = l.latitude; lon0 = l.longitude }
             val la = lastAcc
+            // real movement without steps (train, car): 100 m or more within 30 s keeps the lock off
+            val rp = refPos
+            if (rp == null) { refPos = l; refAt = now } else if (now - refAt >= 30_000L) { if (rp.distanceTo(l) >= 100f) lastMoveAt = now; refPos = l; refAt = now }
             if (la != null) {
                 val d = la.distanceTo(l)
-                if (now - lastAnyStepAt < 45_000L) { // steps in the last 45 s: really moving, only drop tiny jitter
+                if (now - lastAnyStepAt < 45_000L || now - lastMoveAt < 45_000L) { // steps or movement in the last 45 s: only drop tiny jitter
                     lockAnchor = null; lockOut = 0
                     if (d < max(3f, l.accuracy * 0.5f)) { AppLog.count("fix_jitter"); return@launch }
-                } else { // stationary lock: no steps for 45 s, ignore GPS wander (indoor drift) unless clearly leaving
-                    val anc = lockAnchor ?: la.also { lockAnchor = it; lockSince = now; lockOut = 0; AppLog.i("GPS", "stationary lock ON (no steps for 45 s)") }
+                } else { // stationary lock: no steps and no movement for 45 s, ignore GPS wander unless clearly leaving
+                    val anc = lockAnchor ?: la.also { lockAnchor = it; lockSince = now; lockOut = 0; if (now - lastLockLog > 120_000L) { lastLockLog = now; AppLog.i("GPS", "stationary lock ON (no steps or movement for 45 s)") } }
                     val da = anc.distanceTo(l)
                     val out = da > max(40f, 4f * l.accuracy) || (l.hasSpeed() && l.speed >= 5f && da > 25f)
                     lockOut = if (out) lockOut + 1 else 0
                     if (lockOut < 3 && !(out && l.hasSpeed() && l.speed >= 5f && lockOut >= 2)) {
                         AppLog.count("fix_locked"); LiveState.speed.value = 0f
-                        if (gpsActive && now - lockSince > 90_000L && now - lastAnyStepAt > 90_000L) setGpsMode(false)
-                        else if (!gpsActive && (out && lockOut >= 1)) setGpsMode(true, true)
+                        if (gpsActive && !gpsSleeping && now - lockSince > 90_000L && now - lastAnyStepAt > 90_000L) setGpsMode(false)
+                        else if (!gpsActive && !gpsSleeping && out && lockOut >= 1) setGpsMode(true, true)
+                        else if (!gpsActive && !gpsSleeping && lockOut == 0 && now - lockSince > 300_000L && now - lastAnyStepAt > 300_000L && !LiveState.uiVisible.value) gpsSleep()
                         return@launch
                     }
-                    AppLog.i("GPS", "stationary lock OFF: moved ${da.toInt()} m from the anchor"); lockAnchor = null; lockOut = 0
+                    if (now - lastLockLog > 120_000L) { lastLockLog = now; AppLog.i("GPS", "stationary lock OFF: moved ${da.toInt()} m from the anchor") }
+                    lockAnchor = null; lockOut = 0; lastMoveAt = now
                     if (!gpsActive) setGpsMode(true, true)
                 }
                 gDist += d
@@ -251,8 +292,28 @@ class StepCounterService : Service(), SensorEventListener {
         }
     }
 
+    /** Phone has been still for 5+ min: switch GPS off completely. Steps, significant motion or opening the app wake it. */
+    @Synchronized private fun gpsSleep() {
+        if (!prefs.moveOn || gpsSleeping) return
+        try { lm.removeUpdates(locL) } catch (_: Exception) {}
+        gpsSleeping = true; sleepAt = System.currentTimeMillis(); lockAnchor = null
+        try { sigS?.let { sm.requestTriggerSensor(sigL, it) } } catch (e: Exception) { AppLog.e("GPS", "significant motion arm failed", e) }
+        wl?.let { try { if (it.isHeld) it.release() } catch (_: Exception) {} }
+        LiveState.gpsStatus.value = "GPS sleeping (phone is still)"; LiveState.speed.value = 0f
+        AppLog.i("GPS", "GPS SLEEP (still for 5 min), significant-motion sensor=${sigS != null}"); AppLog.count("gps_sleep")
+    }
+    @Synchronized private fun gpsWake(why: String) {
+        if (!gpsSleeping || !prefs.moveOn) return
+        try { sigS?.let { sm.cancelTriggerSensor(sigL, it) } } catch (_: Exception) {}
+        gpsSleeping = false; gpsActive = false // forces a fresh request in ACTIVE mode
+        lastMoveAt = System.currentTimeMillis(); lockAnchor = null; lastHold = 0L
+        AppLog.i("GPS", "GPS WAKE: $why"); AppLog.count("gps_wake")
+        LiveState.gpsStatus.value = "Searching for GPS…"
+        setGpsMode(true, true); holdAwake()
+    }
+
     @Synchronized private fun setGpsMode(active: Boolean, force: Boolean = false) {
-        if (!prefs.moveOn || active == gpsActive) return
+        if (!prefs.moveOn || gpsSleeping || active == gpsActive) return
         val now = System.currentTimeMillis(); if (!force && now - gpsModeAt < 20_000L) return
         try {
             lm.removeUpdates(locL)
@@ -294,6 +355,8 @@ class StepCounterService : Service(), SensorEventListener {
     }
     private fun onStepActivity() {
         lastAnyStepAt = System.currentTimeMillis()
+        if (!fusion.isRunning) fusion.start()
+        if (gpsSleeping) gpsWake("steps")
         if (prefs.moveOn) { holdAwake(); if (!gpsActive) setGpsMode(true, true) }
     }
 
@@ -301,23 +364,16 @@ class StepCounterService : Service(), SensorEventListener {
         when (e.sensor.type) {
             Sensor.TYPE_STEP_COUNTER -> {
                 val v = e.values[0].toLong(); val last = prefs.lastCounter; prefs.lastCounter = v
-                val endTs = eventWall(e); val prev = lastCounterAt; lastCounterAt = endTs
                 lastStepEvtAt = System.currentTimeMillis(); AppLog.count("step_sensor_evt")
                 if (last < 0) AppLog.i("Steps", "first step-counter reading $v (baseline, no steps added)")
                 else if (v < last) { AppLog.w("Steps", "step counter reset: $last -> $v (device reboot?), adding $v"); AppLog.count("counter_reset") }
                 val n = if (last < 0) 0 else if (v >= last) (v - last).toInt() else v.toInt() // v<last => reboot
                 AppLog.count("steps_counter", n.toLong())
-                val known = detSince + accelSince; detSince = 0; accelSince = 0 // steps from the detector / gait fallback are already recorded
-                val extra = n - known
-                if (n > 0) { lastHwStepAt = System.currentTimeMillis(); onStepActivity() }
-                if (extra > 0 && (known == 0 || extra > 1)) {
-                    if (extra >= 100) AppLog.w("Steps", "step counter caught up with $extra steps (sensor was silent)")
-                    if (extra >= 8) AppLog.count("burst_events")
-                    stepsBatch(extra, endTs, prev)
-                }
+                if (n > 0) { synchronized(rLock) { counterCum += n }; lastHwStepAt = System.currentTimeMillis(); onStepActivity(); reconcile(System.currentTimeMillis()) }
             }
             Sensor.TYPE_STEP_DETECTOR -> {
-                val t = eventWall(e); lastHwStepAt = System.currentTimeMillis(); lastStepEvtAt = lastHwStepAt; detSince++
+                val t = eventWall(e); lastHwStepAt = System.currentTimeMillis(); lastStepEvtAt = lastHwStepAt
+                synchronized(rLock) { recCum++ }
                 AppLog.count("step_sensor_evt"); AppLog.count("steps_detector"); onStepActivity()
                 scope.launch { record(t); if (count % 5 == 0) refresh() }
             }
@@ -334,12 +390,30 @@ class StepCounterService : Service(), SensorEventListener {
                     gaitRun = if (dt in 300L..1000L) gaitRun + 1 else 0
                     if (gaitRun >= 4 && now - lastHwStepAt > 12_000L) {
                         val n = if (gaitRun == 4) 4 else 1
-                        accelSince += n; lastStepEvtAt = now; AppLog.count("step_sensor_evt"); AppLog.count("steps_accel", n.toLong()); onStepActivity()
+                        synchronized(rLock) { recCum += n }; lastStepEvtAt = now; AppLog.count("step_sensor_evt"); AppLog.count("steps_accel", n.toLong()); onStepActivity()
                         stepsBatch(n, now, now - n * 500L)
                     }
                 }
             }
         }
+    }
+
+    /**
+     * The hardware counter and the per-step detector count the same steps. Compare running totals and only add what the
+     * detector has not delivered within 15 s (e.g. the first steps of a walk). Never adds the same step twice.
+     */
+    private fun reconcile(now: Long) {
+        var n = 0; var from = 0L
+        synchronized(rLock) {
+            val deficit = (counterCum - recCum).toInt()
+            if (deficit < -50) { recCum = counterCum; deficitSince = 0L; return }
+            if (deficit <= 0) { deficitSince = 0L; return }
+            if (deficitSince == 0L) { deficitSince = now; return }
+            if (now - deficitSince < 15_000L) return
+            n = deficit; from = deficitSince; recCum += n; deficitSince = 0L
+        }
+        AppLog.count("steps_recon", n.toLong())
+        stepsBatch(n, now, from)
     }
 
     /** Record n steps spread evenly over the interval since the previous report (sensor batches arrive every ~10 s). */

@@ -14,7 +14,7 @@ import java.util.concurrent.ConcurrentHashMap
  * Everything stays on the phone. It is exported only when you tap an export button in More > Diagnostics.
  */
 object AppLog {
-    private const val MAX = 2_500_000L
+    private const val MAX = 4_000_000L
     @Volatile private var dir: File? = null
     private var sp: android.content.SharedPreferences? = null
     private val lock = Any()

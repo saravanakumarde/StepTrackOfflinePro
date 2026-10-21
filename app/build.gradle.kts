@@ -2,7 +2,7 @@ plugins { id("com.android.application"); id("org.jetbrains.kotlin.android"); id(
 android {
     namespace = "com.steptrack.offline"
     compileSdk = 34
-    defaultConfig { applicationId = "com.steptrack.offline"; minSdk = 26; targetSdk = 34; versionCode = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1; versionName = "16" }
+    defaultConfig { applicationId = "com.steptrack.offline"; minSdk = 26; targetSdk = 34; versionCode = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1; versionName = "17" }
     signingConfigs {
         create("release") {
             storeFile = file("steptrack-release.jks")

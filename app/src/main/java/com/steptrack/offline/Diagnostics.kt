@@ -63,7 +63,7 @@ object Diagnostics {
         val moves = runBlocking { dao.allMoves() }
         val places = runBlocking { dao.allPlaces() }
         val stepTs = LongArray(events.size) { events[it].timestamp }
-        val types = classifyMoves(gps, events.map { it.timestamp })
+        val types = classifyMoves(gps, events.map { it.timestamp }, stationPlaces(places, pr.stationIds))
         val now = System.currentTimeMillis()
 
         l("STEPTRACK OFFLINE PRO - DIAGNOSTIC REPORT"); l("Generated: ${tf(now)}  (epoch $now)  timezone ${TimeZone.getDefault().id}")
@@ -135,6 +135,16 @@ object Diagnostics {
                 ex.forEach { l("   ${tf(it.timestamp)}  ${names[it.reason] ?: it.reason}  status=${it.status}  importance=${it.importance}  ${it.description ?: ""}") }
             }
         }
+        sec("6b. BATTERY BY STATE (from the log)") { batteryStats(0L).forEach { l("  $it") } }
+        sec("6c. STEP RECONCILIATION (log sensor totals vs recorded steps per day)") {
+            val tot = sortedMapOf<String, LongArray>()
+            fun g(ln: String, k: String) = Regex("(?:steps_)?$k=(\\d+)").find(ln)?.groupValues?.get(1)?.toLong() ?: 0L
+            for (ln in AppLog.text().lineSequence()) if (ln.contains(" I/HB ")) { val a = tot.getOrPut(ln.substring(0, 10)) { LongArray(3) }; a[0] += g(ln, "counter"); a[1] += g(ln, "detector"); a[2] += g(ln, "recon") }
+            l("  date | hardware counter | step detector | added by reconcile | recorded in database | recorded / max(sensor)")
+            tot.forEach { (d, a) -> val rec = events.count { it.date == d }; val mx = maxOf(a[0], a[1]); l("  $d | ${a[0]} | ${a[1]} | ${a[2]} | $rec | ${if (mx > 0) "%.2f".format(Locale.US, rec.toDouble() / mx) else "-"}") }
+            val lines = AppLog.text().lineSequence().toList()
+            l("  stationary-lock ON/OFF log lines: ${lines.count { it.contains("stationary lock ON") }} / ${lines.count { it.contains("stationary lock OFF") }}   GPS sleep/wake lines: ${lines.count { it.contains("GPS SLEEP") }} / ${lines.count { it.contains("GPS WAKE") }}")
+        }
         sec("7. DATA OVERVIEW") {
             l("rows: step_events=${events.size}  gps_points=${gps.size}  movement_points=${moves.size}  places=${places.size}")
             val dbf = c.getDatabasePath("steps.db"); l("database file=${dbf.length() / 1024} KB  (+wal ${java.io.File(dbf.path + "-wal").let { if (it.exists()) it.length() / 1024 else 0 }} KB)")
@@ -195,7 +205,11 @@ object Diagnostics {
             real.takeLast(40).forEach { t ->
                 val a = gps[t.first()]; val b = gps[t.last()]; val d = (b.distance - a.distance).coerceAtLeast(0f); val secs = ((b.timestamp - a.timestamp) / 1000f).coerceAtLeast(1f)
                 val dom = t.groupingBy { types[it] }.eachCount().maxByOrNull { it.value }?.key ?: 0
-                l("  ${tf(a.timestamp)} | ${(b.timestamp - a.timestamp) / 60000} min | ${f2(d / 1000f)} km | avg ${f1(d / secs * 3.6f)} km/h | main=${MOVE_NAMES[dom]} | ${placeFor(a.lat, a.lon, places)?.name ?: "?"} -> ${placeFor(b.lat, b.lon, places)?.name ?: "?"}")
+                l("  ${tf(a.timestamp)} | ${(b.timestamp - a.timestamp) / 60000} min | ${f2(d / 1000f)} km | avg ${f1(d / secs * 3.6f)} km/h | main=${MOVE_NAMES[dom]} | ${placeNear(a.lat, a.lon, places)?.name ?: "?"} -> ${placeNear(b.lat, b.lon, places)?.name ?: "?"}")
+            }
+            if (places.isNotEmpty()) {
+                val rr = FloatArray(1); val ends = real.flatMap { t -> listOf(gps[t.first()], gps[t.last()]) }.map { g -> places.minOf { p -> android.location.Location.distanceBetween(g.lat, g.lon, p.lat, p.lon, rr); rr[0] } }
+                l("trip start/end distance to the nearest saved place (${ends.size} points): " + listOf(0f to 20f, 20f to 50f, 50f to 100f, 100f to 150f, 150f to 500f, 500f to 1e9f).joinToString("  ") { (lo, hi) -> "${lo.toInt()}-${if (hi > 1e8f) "inf" else hi.toInt()} m: ${ends.count { it >= lo && it < hi }}" })
             }
             if (places.isNotEmpty()) { l("GPS points inside each place:"); places.forEach { p -> l("  ${p.name}: ${gps.count { placeFor(it.lat, it.lon, listOf(p)) != null }}") } }
         }
@@ -228,8 +242,13 @@ object Diagnostics {
                 l("  samples=${diffs.size}  mean offset=${f1(cm)} deg  mean |error|=${f1(ab.average())} deg  median |error|=${f1(pctile(ab, 0.5))}  p90 |error|=${f1(pctile(ab, 0.9))}")
                 l("  (samples where GPS had no bearing and the app used the compass are excluded)")
             } else l("  not enough samples (need walking with GPS bearing)")
-            val es = elevStats(altSeries(events, gps).map { it.second }, if (LiveState.baro.value) 1.5f else 6f)
-            l("elevation: " + (es?.let { "min ${f1(it.min)} m, max ${f1(it.max)} m, ascent ${f1(it.ascent)} m, descent ${f1(it.descent)} m, net ${f1(it.net)} m" } ?: "no altitude data"))
+            val hy = if (LiveState.baro.value) 1.5f else 10f; var tu = 0f; var td = 0f
+            l("elevation per day (hysteresis ${hy.toInt()} m; days are never joined, so level shifts between days are not counted as climbing):")
+            (events.map { it.date } + gps.map { it.date }).distinct().sorted().forEach { d ->
+                val es = elevStats(altSeries(events.filter { it.date == d }, gps.filter { it.date == d }).map { it.second }, hy)
+                if (es != null) { tu += es.ascent; td += es.descent; l("  $d: min ${f1(es.min)} max ${f1(es.max)} median-range, ascent ${f1(es.ascent)} m, descent ${f1(es.descent)} m") }
+            }
+            l("elevation total over all days: ascent ${f1(tu)} m, descent ${f1(td)} m")
         }
         sec("12. BACKUP AND STORAGE FILES") {
             l("storage access allowed=${AutoBackup.canWrite(c)}  lastStatus='${LiveState.backupStatus.value}'")
@@ -244,6 +263,37 @@ object Diagnostics {
             l("log size ${AppLog.sizeBytes() / 1024} KB, ${AppLog.lineCount()} lines"); l(AppLog.tail(400))
         }
         return sb.toString()
+    }
+
+    /** Battery drain per hour by state, parsed from the heartbeat lines in the log (screen off, not charging). */
+    fun batteryStats(since: Long): List<String> {
+        class H(val t: Long, val bat: Int, val chg: Boolean, val scr: Boolean, val mode: String, val wl: Boolean, val doze: Boolean)
+        val f = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US); val re = Regex("bat=(\\d+)% chg=(\\w+) psave=\\w+ doze=(\\w+) screen=(\\w+) wakelock=(\\w+) gpsMode=(\\w+)")
+        val hs = ArrayList<H>()
+        for (ln in AppLog.text().lineSequence()) {
+            if (!ln.contains(" I/HB ") || ln.length < 20) continue
+            val t = try { f.parse(ln.substring(0, 19))!!.time } catch (_: Exception) { continue }
+            if (t < since) continue
+            val m = re.find(ln) ?: continue
+            hs.add(H(t, m.groupValues[1].toInt(), m.groupValues[2] == "true", m.groupValues[4] == "true", m.groupValues[6], m.groupValues[5] == "true", m.groupValues[3] == "true"))
+        }
+        if (hs.size < 3) return listOf("not enough heartbeat data yet")
+        val out = ArrayList<String>()
+        fun drain(label: String, cond: (H) -> Boolean) {
+            var th = 0.0; var dr = 0
+            for (i in 1 until hs.size) { val a = hs[i - 1]; val b = hs[i]; val h = (b.t - a.t) / 3_600_000.0
+                if (h > 0.25 || a.chg || b.chg || b.bat > a.bat || !cond(a)) continue; th += h; dr += a.bat - b.bat }
+            if (th >= 0.5) out.add("%-34s %5.1f h  %3d%%  =  %.2f %%/h".format(Locale.US, label, th, dr, dr / th))
+        }
+        drain("screen off (all)") { !it.scr }
+        drain("screen off, GPS 1 s fixes") { !it.scr && it.mode == "1s" }
+        drain("screen off, GPS 10 s fixes") { !it.scr && it.mode == "10s" }
+        drain("screen off, GPS sleeping") { !it.scr && it.mode == "off" }
+        drain("screen on") { it.scr }
+        val n = hs.size.toDouble()
+        out.add("time share: GPS 1 s %.0f%%, 10 s %.0f%%, sleeping %.0f%%; wake lock held %.0f%%; doze %.0f%%; screen on %.0f%%".format(Locale.US,
+            100 * hs.count { it.mode == "1s" } / n, 100 * hs.count { it.mode == "10s" } / n, 100 * hs.count { it.mode == "off" } / n, 100 * hs.count { it.wl } / n, 100 * hs.count { it.doze } / n, 100 * hs.count { it.scr } / n))
+        return out
     }
 
     private class NoClose(o: OutputStream) : FilterOutputStream(o) {

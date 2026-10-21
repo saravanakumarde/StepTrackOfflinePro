@@ -3,22 +3,36 @@ import android.content.Context
 import android.hardware.*
 import kotlin.math.abs
 
-/** Azimuth 0-360 (magnetic north). TYPE_ROTATION_VECTOR, else ACCELEROMETER + MAGNETIC_FIELD. Auto-remaps when phone is upright. */
+/** Azimuth 0-360 (true north: magnetic + offline declination + learned offset from GPS course). TYPE_ROTATION_VECTOR, else ACCELEROMETER + MAGNETIC_FIELD. Auto-remaps when phone is upright. */
 class SensorFusionHelper(ctx: Context, private val cb: (Float, Int) -> Unit) : SensorEventListener {
     private val sm = ctx.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     private val rot = sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
     private val g = FloatArray(3); private val m = FloatArray(3); private var hm = false; private var hg = false
     private val r = FloatArray(9); private val r2 = FloatArray(9); private val o = FloatArray(3)
-    @Volatile var heading = 0f; private var init = false; private var acc = 0
+    @Volatile private var rawMag = 0f; private var init = false; private var acc = 0
+    @Volatile var declination = 0f   // magnetic -> true north, from GeomagneticField (offline)
+    @Volatile var offset = 0f        // learned from GPS course while walking (how the phone is carried)
+    private var running = false
+    val isRunning: Boolean get() = running
+    val heading: Float get() = ((rawMag + declination + offset) % 360f + 360f) % 360f
+    /** Nudge the learned offset towards the GPS course (slow, ignores wild differences such as a phone held sideways). */
+    fun learn(gpsBearing: Float) {
+        var d = gpsBearing - ((rawMag + declination) % 360f + 360f) % 360f
+        while (d > 180f) d -= 360f; while (d < -180f) d += 360f
+        if (abs(d) > 120f) return
+        offset = (offset + 0.02f * (d - offset)).coerceIn(-60f, 60f)
+    }
 
+    /** 5 Hz is plenty for walking headings (the default UI rate delivered 50 events/s on this phone). */
     fun start() {
-        val d = SensorManager.SENSOR_DELAY_UI
-        if (rot != null) sm.registerListener(this, rot, d) else {
-            sm.registerListener(this, sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER), d)
-            sm.registerListener(this, sm.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD), d)
+        if (running) return; running = true
+        val d = 200_000
+        if (rot != null) sm.registerListener(this, rot, d, 0) else {
+            sm.registerListener(this, sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER), d, 0)
+            sm.registerListener(this, sm.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD), d, 0)
         }
     }
-    fun stop() = sm.unregisterListener(this)
+    fun stop() { if (!running) return; running = false; sm.unregisterListener(this) }
     override fun onAccuracyChanged(s: Sensor, a: Int) { if (a != acc) AppLog.i("Compass", "accuracy ${s.name}: $acc -> $a"); acc = a; cb(heading, a) }
     override fun onSensorChanged(e: SensorEvent) {
         when (e.sensor.type) {
@@ -43,9 +57,9 @@ class SensorFusionHelper(ctx: Context, private val cb: (Float, Int) -> Unit) : S
             SensorManager.getOrientation(r2, o); az = o[0]
         }
         val deg = ((Math.toDegrees(az.toDouble()).toFloat()) + 360f) % 360f
-        if (!init) { heading = deg; init = true } else {
-            var d = deg - heading; if (d > 180) d -= 360; if (d < -180) d += 360
-            heading = (heading + 0.2f * d + 360f) % 360f
+        if (!init) { rawMag = deg; init = true } else {
+            var d = deg - rawMag; if (d > 180) d -= 360; if (d < -180) d += 360
+            rawMag = (rawMag + 0.3f * d + 360f) % 360f
         }
         cb(heading, acc)
     }
